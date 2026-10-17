@@ -1,6 +1,15 @@
-![](https://img.shields.io/github/license/classy-giraffe/easy-arch?label=License)
-![](https://img.shields.io/github/stars/classy-giraffe/easy-arch?label=Stars)
-![](https://img.shields.io/github/forks/classy-giraffe/easy-arch?label=Forks)
+
+Go to [easy-arch](https://github.com/classy-giraffe/easy-arch) for the original. 
+
+I like limine, I will use limine.
+
+## One-step Automated Install
+
+### `bash <(curl -sL tinyurl.com/easy-arch-limine)`
+
+
+<details>
+  <summary>easy-arch original readme</summary>
 
 [easy-arch](https://github.com/classy-giraffe/easy-arch) is a **bash script** that boostraps [Arch Linux](https://archlinux.org/) with sane opinionated defaults.
 
@@ -48,3 +57,5 @@ The **BTRFS subvolumes layout** follows the traditional and suggested layout use
 | 5                | @snapshots     | /.snapshots                   |
 | 6                | @var_log       | /var/log                      |
 | 7                | @var_pkgs      | /var/cache/pacman/pkg         |
+
+</details>
