@@ -360,7 +360,7 @@ microcode_detector
 
 # Pacstrap (setting up a base sytem onto the new root).
 info_print "Installing the base system (it may take a while)."
-pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs grub grub-btrfs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
+pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs limine rsync efibootmgr base-devel git snapper reflector snap-pac zram-generator sudo &>/dev/null
 
 # Setting up the hostname.
 echo "$hostname" > /mnt/etc/hostname
@@ -394,13 +394,34 @@ cat > /mnt/etc/mkinitcpio.conf <<EOF
 HOOKS=(systemd autodetect keyboard sd-vconsole modconf block sd-encrypt filesystems)
 EOF
 
-# Setting up LUKS2 encryption in grub.
-info_print "Setting up grub config."
+# Setting up Limine config (lives at the root of the ESP, which is mounted at /boot).
+# Unlike grub-mkconfig, Limine won't add rootflags for us, so the @ subvolume is set explicitly.
+info_print "Setting up Limine config."
 UUID=$(blkid -s UUID -o value $CRYPTROOT)
-sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&rd.luks.name=$UUID=cryptroot root=$BTRFS," /mnt/etc/default/grub
+# The //Snapshots line is where limine-snapper-sync inserts snapshot boot entries.
+cat > /mnt/boot/limine.conf <<EOF
+timeout: 5
+
+/+Arch Linux
+//$kernel
+    protocol: linux
+    path: boot():/vmlinuz-$kernel
+    cmdline: rd.luks.name=$UUID=cryptroot root=$BTRFS rootflags=subvol=@ rw
+    module_path: boot():/$microcode.img
+    module_path: boot():/initramfs-$kernel.img
+//Snapshots
+EOF
+
+# limine-snapper-sync settings. This layout keeps snapshots in the top-level @snapshots
+# subvolume rather than the default nested /@/.snapshots, so the paths are set explicitly.
+cat > /mnt/etc/default/limine <<EOF
+ESP_PATH="/boot"
+ROOT_SUBVOLUME_PATH="/@"
+ROOT_SNAPSHOTS_PATH="/@snapshots"
+EOF
 
 # Configuring the system.
-info_print "Configuring the system (timezone, system clock, initramfs, Snapper, GRUB)."
+info_print "Configuring the system (timezone, system clock, initramfs, Snapper, Limine)."
 arch-chroot /mnt /bin/bash -e <<EOF
 
     # Setting up timezone.
@@ -424,11 +445,14 @@ arch-chroot /mnt /bin/bash -e <<EOF
     mount -a &>/dev/null
     chmod 750 /.snapshots
 
-    # Installing GRUB.
-    grub-install --target=x86_64-efi --efi-directory=/boot/ --bootloader-id=GRUB &>/dev/null
+    # Installing Limine to the ESP.
+    mkdir -p /boot/EFI/limine /boot/EFI/BOOT
+    cp /usr/share/limine/BOOTX64.EFI /boot/EFI/limine/
+    # Fallback path, so firmware that ignores NVRAM entries (and many VMs) still boots.
+    cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/
 
-    # Creating grub config file.
-    grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
+    # Creating a UEFI boot entry for Limine.
+    efibootmgr --create --disk $DISK --part 1 --label "Arch Linux Limine Bootloader" --loader '\\EFI\\limine\\BOOTX64.EFI' --unicode &>/dev/null
 
 EOF
 
@@ -445,9 +469,29 @@ if [[ -n "$username" ]]; then
     echo "$username:$userpass" | arch-chroot /mnt chpasswd
 fi
 
+# Snapshot boot entries (limine-snapper-sync from the AUR).
+# makepkg refuses to run as root, so a temporary build user installs yay and then
+# limine-snapper-sync. yay stays installed so the AUR package can be updated later.
+# A failure here doesn't abort the install; the system still boots, just without snapshot entries.
+info_print "Installing limine-snapper-sync from the AUR (it may take a while)."
+arch-chroot /mnt useradd -m aurbuild
+echo "aurbuild ALL=(ALL) NOPASSWD: /usr/bin/pacman" > /mnt/etc/sudoers.d/aurbuild
+if arch-chroot /mnt su - aurbuild -c '
+    set -e
+    git clone https://aur.archlinux.org/yay-bin.git
+    cd yay-bin && makepkg -si --noconfirm
+    yay -S --noconfirm --needed --answerdiff None --answerclean None --removemake limine-snapper-sync
+' &>/dev/null; then
+    systemctl enable limine-snapper-watcher.service --root=/mnt &>/dev/null
+else
+    error_print "Couldn't install limine-snapper-sync; install it after first boot to get snapshot entries."
+fi
+rm -f /mnt/etc/sudoers.d/aurbuild
+arch-chroot /mnt userdel -r aurbuild &>/dev/null || true
+
 # Boot backup hook.
 info_print "Configuring /boot backup when pacman transactions are made."
-mkdir /mnt/etc/pacman.d/hooks
+mkdir -p /mnt/etc/pacman.d/hooks
 cat > /mnt/etc/pacman.d/hooks/50-bootbackup.hook <<EOF
 [Trigger]
 Operation = Upgrade
@@ -463,6 +507,21 @@ When = PostTransaction
 Exec = /usr/bin/rsync -a --delete /boot /.bootbackup
 EOF
 
+# Limine deploy hook (the package doesn't update the ESP copy on its own).
+info_print "Configuring Limine redeployment when the limine package is upgraded."
+cat > /mnt/etc/pacman.d/hooks/99-limine.hook <<EOF
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = limine
+
+[Action]
+Description = Deploying Limine after upgrade...
+When = PostTransaction
+Exec = /bin/sh -c "/usr/bin/cp /usr/share/limine/BOOTX64.EFI /boot/EFI/limine/ && /usr/bin/cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/"
+EOF
+
 # ZRAM configuration.
 info_print "Configuring ZRAM."
 cat > /mnt/etc/systemd/zram-generator.conf <<EOF
@@ -476,7 +535,7 @@ sed -Ei 's/^#(Color)$/\1\nILoveCandy/;s/^#(ParallelDownloads).*/\1 = 10/' /mnt/e
 
 # Enabling various services.
 info_print "Enabling Reflector, automatic snapshots, BTRFS scrubbing and systemd-oomd."
-services=(reflector.timer snapper-timeline.timer snapper-cleanup.timer btrfs-scrub@-.timer btrfs-scrub@home.timer btrfs-scrub@var-log.timer btrfs-scrub@\\x2esnapshots.timer grub-btrfsd.service systemd-oomd)
+services=(reflector.timer snapper-timeline.timer snapper-cleanup.timer btrfs-scrub@-.timer btrfs-scrub@home.timer btrfs-scrub@var-log.timer btrfs-scrub@\\x2esnapshots.timer systemd-oomd)
 for service in "${services[@]}"; do
     systemctl enable "$service" --root=/mnt &>/dev/null
 done
